@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "src/main/rust/Cargo.toml"
+    ],
+    "java.configuration.updateBuildConfiguration": "interactive"
+}

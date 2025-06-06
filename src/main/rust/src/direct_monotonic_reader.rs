@@ -1,19 +1,23 @@
 // https://github.com/apache/lucene/blob/main/lucene/core/src/java/org/apache/lucene/util/packed/DirectMonotonicReader.java
 // https://github.com/apache/lucene/blob/main/lucene/core/src/java/org/apache/lucene/util/packed/DirectReader.java
 
-#[derive(Copy, Clone, Default)]
+use bytes::Buf;
+
+use crate::vint::VIntBuf;
+
+#[derive(Copy, Clone, Default, Debug)]
 struct BlockMeta {
     min: u64,
     avg: f32,
-    bpv: u8,
     offset: u64,
+    bpv: u8,
 }
 
 impl BlockMeta {
     const CODED_SIZE: usize = std::mem::size_of::<u64>()
         + std::mem::size_of::<f32>()
-        + std::mem::size_of::<u8>()
-        + std::mem::size_of::<u64>();
+        + std::mem::size_of::<u64>()
+        + std::mem::size_of::<u8>();
 
     // NB: this may read up to 3 bytes beyond the end of the value.
     fn get(&self, data: &[u8], index: usize) -> u64 {
@@ -32,10 +36,8 @@ impl BlockMeta {
             48 => self.get_bit_sized::<48>(data, index),
             56 => self.get_bit_sized::<56>(data, index),
             64 => self.get_bit_sized::<64>(data, index),
-            _ => unreachable!(),
+            _ => unreachable!("bpv: {}", self.bpv),
         }
-        // DirectReader takes input, bpv, and offset at construction.
-        // takes block_index at get.
     }
 
     fn get_bit_sized<const N: usize>(&self, data: &[u8], index: usize) -> u64 {
@@ -46,8 +48,8 @@ impl BlockMeta {
         let shift = match N {
             1 => index & 7,
             2 => index & 3,
-            _ if N % 4 == 0 => index & 1,
-            8 => 0,
+            _ if N % 8 == 0 => 0,
+            _ if N % 4 == 0 => (index & 1) * 4,
             _ => unreachable!(),
         };
         let value = u64::from_le_bytes(buf) >> shift;
@@ -60,28 +62,35 @@ impl BlockMeta {
 }
 
 impl From<&[u8]> for BlockMeta {
-    fn from(value: &[u8]) -> Self {
-        let (value, min) = value.split_at(std::mem::size_of::<u64>());
-        let (value, avg) = value.split_at(std::mem::size_of::<f32>());
-        let (value, bpv) = value.split_at(std::mem::size_of::<u8>());
-        let (_, offset) = value.split_at(std::mem::size_of::<u64>());
+    fn from(mut value: &[u8]) -> Self {
+        let min = value.get_u64_le();
+        let avg = value.get_f32_le();
+        let offset = value.get_u64_le();
+        let bpv = value.get_u8();
         Self {
-            min: u64::from_le_bytes(min.try_into().unwrap()),
-            avg: f32::from_le_bytes(avg.try_into().unwrap()),
-            bpv: u8::from_le_bytes(bpv.try_into().unwrap()),
-            offset: u64::from_le_bytes(offset.try_into().unwrap()),
+            min,
+            avg,
+            bpv,
+            offset,
         }
     }
 }
 
-pub struct Meta {
+#[derive(Debug)]
+struct Meta {
     block_shift: usize,
     block_mask: usize,
-    blocks: Box<[BlockMeta]>,
+    blocks: Vec<BlockMeta>,
 }
 
 impl Meta {
-    pub fn new(values_len: usize, mut block_shift: usize, input: &[u8]) -> Self {
+    const EMPTY: Meta = Meta {
+        block_shift: 1,
+        block_mask: 0,
+        blocks: vec![],
+    };
+
+    fn new(values_len: usize, mut block_shift: usize, input: &[u8]) -> (Self, &[u8]) {
         let block_len = (values_len + ((1 << block_shift) - 1)) >> block_shift;
         let mut blocks = Vec::with_capacity(block_len);
         let mut all_zeros = true;
@@ -96,22 +105,49 @@ impl Meta {
             blocks = vec![BlockMeta::default(); 1];
         }
 
-        Self {
-            block_shift,
-            block_mask: (1 << block_shift) - 1,
-            blocks: blocks.into_boxed_slice(),
-        }
+        (
+            Self {
+                block_shift,
+                block_mask: (1 << block_shift) - 1,
+                blocks,
+            },
+            &input[(BlockMeta::CODED_SIZE * block_len)..],
+        )
     }
 }
 
+/// DirectMonotonicReader maps an index to a 64-bit offset.
+///
+/// This eagerly decodes data needed to locate the data for an index which it maintains in memory.
+/// It also maintains a reference to a slice that contains the raw data to decode for the offset.
 pub struct DirectMonotonicReader<'a> {
+    // TODO: meta blocks are fixed size, consider using them directly from the backing slice to
+    // reduce heap usage.
     meta: Meta,
     data: &'a [u8],
 }
 
 impl<'a> DirectMonotonicReader<'a> {
-    pub fn new(meta: Meta, data: &'a [u8]) -> Self {
-        Self { meta, data }
+    pub fn new(values_len: usize, mut offset_meta: &[u8], index_data: &'a [u8]) -> Self {
+        if values_len == 0 {
+            return Self {
+                meta: Meta::EMPTY,
+                data: [].as_slice(),
+            };
+        }
+
+        let off = offset_meta.get_u64_le();
+        let block_shift = offset_meta
+            .get_vi64()
+            .expect("offset block_shift")
+            .try_into()
+            .unwrap();
+        let (meta, mut field_meta) = Meta::new(values_len, block_shift, offset_meta);
+        let len = field_meta.get_u64_le();
+        Self {
+            meta,
+            data: &index_data[off as usize..(off + len) as usize],
+        }
     }
 
     pub fn get(&self, index: usize) -> u64 {

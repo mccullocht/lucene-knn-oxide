@@ -1,0 +1,18 @@
+plugins {
+    id("fr.stardustenterprises.rust.wrapper")
+}
+
+rust {
+    // Setting the global "default" vars
+    release.set(true)
+
+    // you can also use tools like "cross"
+    command.set("cargo")
+
+    targets {
+        create("macos-aarch64") {
+            target = "aarch64-apple-darwin"
+            outputName = "liblucene_knn_oxide.dylib"
+        }
+    }
+}
