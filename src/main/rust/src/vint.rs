@@ -7,10 +7,12 @@
 pub struct Overflow;
 
 pub trait VIntBuf: bytes::Buf {
+    #[inline(always)]
     fn get_vi32(&mut self) -> Result<i32, Overflow> {
         self.get_vi64()?.try_into().map_err(|_| Overflow)
     }
 
+    #[inline(always)]
     fn get_vi64(&mut self) -> Result<i64, Overflow> {
         let mut v = 0i64;
         for i in 0..9 {

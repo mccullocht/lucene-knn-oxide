@@ -20,6 +20,7 @@ impl BlockMeta {
         + std::mem::size_of::<u8>();
 
     // NB: this may read up to 3 bytes beyond the end of the value.
+    #[inline(always)]
     fn get(&self, data: &[u8], index: usize) -> u64 {
         match self.bpv {
             1 => ((data[self.offset as usize + (index / 8)] >> (index & 7)) & 0x1).into(),
@@ -150,6 +151,7 @@ impl<'a> DirectMonotonicReader<'a> {
         }
     }
 
+    #[inline(always)]
     pub fn get(&self, index: usize) -> u64 {
         let block = &self.meta.blocks[index >> self.meta.block_shift];
         let block_index = index & self.meta.block_mask;

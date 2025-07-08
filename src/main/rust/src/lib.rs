@@ -3,22 +3,21 @@
 //! With this implementation it is necessary to parse the field metadata once on each side of the
 //! FFI boundary since this implementation does not interact with IndexInput.
 
-#![allow(dead_code)] // XXX FIXME
-
 pub mod direct_monotonic_reader;
 pub mod vint;
 
-use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::iter::FusedIterator;
 
+use ahash::AHashSet;
 use bytes::Buf;
-use roaring::RoaringBitmap;
+use min_max_heap::MinMaxHeap;
 use simsimd::SpatialSimilarity;
 
 use crate::direct_monotonic_reader::DirectMonotonicReader;
 use crate::vint::VIntBuf;
 
+#[allow(dead_code)]
 pub struct FieldHnswIndex {
     /// Raw encoded index bytes for this field.
     data: &'static [u8],
@@ -42,6 +41,11 @@ pub struct FieldHnswIndex {
 }
 
 impl FieldHnswIndex {
+    // XXX consider accepting vector data as well and putting all the upper level vectors in heap
+    // memory per-level. this is ~7% memory increase but < 1% if only for level > 1. Only a few
+    // percent of scoring happens here so it may not be worth it, even if this improves caching
+    // and reduces memory latency.
+    // XXX consider recording stats in this struct and printing them on drop.
     fn new(mut field_meta: &'static [u8], index_data: &'static [u8]) -> Option<Self> {
         let encoding: VectorEncoding = field_meta
             .get_i32_le()
@@ -185,6 +189,7 @@ pub struct HnswVertexEdgeIter<'a> {
 }
 
 impl<'a> HnswVertexEdgeIter<'a> {
+    #[inline(always)]
     fn new(mut buf: &'a [u8]) -> Self {
         let edges = buf.get_vi32().expect("vertex edge len").try_into().unwrap();
         Self {
@@ -198,6 +203,7 @@ impl<'a> HnswVertexEdgeIter<'a> {
 impl Iterator for HnswVertexEdgeIter<'_> {
     type Item = u32;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.edges == 0 {
             return None;
@@ -226,6 +232,7 @@ impl ExactSizeIterator for HnswVertexEdgeIter<'_> {}
 
 impl FusedIterator for HnswVertexEdgeIter<'_> {}
 
+#[allow(dead_code)]
 pub struct FieldVectorData {
     encoding: VectorEncoding,
     similarity: VectorSimilarity,
@@ -310,12 +317,14 @@ impl FieldVectorData {
         })
     }
 
+    #[inline(always)]
     pub fn get(&self, index: usize) -> &[f32] {
         assert!(index < self.len, "index={} len={}", index, self.len);
         let start = index * self.dimensions;
         &self.vector_data[start..(start + self.dimensions)]
     }
 
+    #[inline(always)]
     pub fn score_ord(&self, query: &[f32], ord: u32) -> Neighbor {
         Neighbor {
             vertex: ord,
@@ -373,6 +382,8 @@ impl VectorSimilarity {
         match self {
             Self::Euclidean => 1.0f32 / (1.0f32 + SpatialSimilarity::l2sq(q, d).unwrap() as f32),
             Self::DotProduct => {
+                // I tried a manual aarch64 SIMD implementation where I unrolled the loop (16d)
+                // and it was not any faster, maybe actually slower.
                 0.0f32.max((1.0f32 + SpatialSimilarity::dot(q, d).unwrap() as f32) / 2.0f32)
             }
             Self::Cosine => unimplemented!(),
@@ -412,12 +423,14 @@ impl PartialEq for Neighbor {
 impl Eq for Neighbor {}
 
 impl PartialOrd for Neighbor {
+    #[inline(always)]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Neighbor {
+    #[inline(always)]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.score
             .total_cmp(&other.score)
@@ -440,6 +453,7 @@ impl NeighborQueue {
         }
     }
 
+    #[inline(always)]
     pub fn push(&mut self, neighbor: Neighbor) {
         if self.queue.len() < self.limit {
             self.queue.push(neighbor);
@@ -451,6 +465,7 @@ impl NeighborQueue {
         }
     }
 
+    #[inline(always)]
     pub fn min_similarity(&self) -> f32 {
         self.queue.peek().map(|n| n.score).unwrap_or(f32::MIN)
     }
@@ -534,6 +549,7 @@ impl FusedIterator for FixedBitSetIter<'_> {}
 /// Search for `query` in this field and return up to `results.len()` neighbors.
 /// If `accept_ords` is specified, contains a bitmap of LSB u64s indicating if each ordinal is accepted.
 /// Returns the number of valid results added to neighbors.
+#[inline(never)]
 fn search(
     index: &FieldHnswIndex,
     vector_data: &FieldVectorData,
@@ -571,6 +587,7 @@ fn search(
     result_len
 }
 
+#[inline(never)]
 fn search_exhaustively(
     vector_data: &FieldVectorData,
     query: &[f32],
@@ -582,6 +599,7 @@ fn search_exhaustively(
     }
 }
 
+#[inline(never)]
 fn search_index(
     index: &FieldHnswIndex,
     vector_data: &FieldVectorData,
@@ -589,31 +607,10 @@ fn search_index(
     accept_ords: Option<&FixedBitSet<'_>>,
     queue: &mut NeighborQueue,
 ) {
-    let mut best_entry_point = vector_data.score_ord(query, index.entry_point());
-    let mut visited = RoaringBitmap::new();
-    visited.insert(best_entry_point.vertex);
-    for level in (1..(index.upper_levels.len() + 1)).rev() {
-        let mut found_better = true;
-        while found_better {
-            found_better = false;
-            for vertex in index.edge_iter(level, best_entry_point.vertex) {
-                if !visited.insert(vertex) {
-                    continue;
-                }
-
-                let n = vector_data.score_ord(query, vertex);
-                if n < best_entry_point {
-                    best_entry_point = n;
-                    found_better = true;
-                }
-            }
-        }
-    }
-    visited.clear();
-
-    // Reverse<Neighbor> to get the most promising candidates at the top of the queue.
-    let mut candidates = BinaryHeap::with_capacity(queue.len());
-    candidates.push(Reverse(best_entry_point));
+    let best_entry_point = find_best_entry_point(index, vector_data, query);
+    let mut visited = AHashSet::with_capacity(10_000);
+    let mut candidates = MinMaxHeap::with_capacity(queue.len() + 1);
+    candidates.push(best_entry_point);
     visited.insert(best_entry_point.vertex);
     if accept_ords
         .map(|s| s.get(best_entry_point.vertex as usize))
@@ -621,7 +618,7 @@ fn search_index(
     {
         queue.push(best_entry_point);
     }
-    while let Some(Reverse(candidate)) = candidates.pop() {
+    while let Some(candidate) = candidates.pop_min() {
         // If the best candidate is worse than the worst result, break.
         if candidate.score < queue.min_similarity() {
             break;
@@ -633,14 +630,42 @@ fn search_index(
             }
 
             let n = vector_data.score_ord(query, vertex);
+            // This differs from lucene in that we limit the length of the queue.
+            if candidates.len() < queue.len() {
+                candidates.push(n);
+            } else {
+                candidates.push_pop_max(n);
+            }
             if accept_ords.map(|s| s.get(vertex as usize)).unwrap_or(true) {
                 queue.push(n);
             }
-
-            // NB: Lucene NeighborQueue does not have any way of limiting the size of this queue.
-            candidates.push(Reverse(n));
         }
     }
+}
+
+#[inline(never)]
+fn find_best_entry_point(
+    index: &FieldHnswIndex,
+    vector_data: &FieldVectorData,
+    query: &[f32],
+) -> Neighbor {
+    let mut best_entry_point = vector_data.score_ord(query, index.entry_point());
+    // NB: don't perform a visited check like lucene does here. It does prevent us from re-scoring
+    // vectors but otherwise has very little upside.
+    for level in (1..(index.upper_levels.len() + 1)).rev() {
+        let mut found_better = true;
+        while found_better {
+            found_better = false;
+            for vertex in index.edge_iter(level, best_entry_point.vertex) {
+                let n = vector_data.score_ord(query, vertex);
+                if n < best_entry_point {
+                    best_entry_point = n;
+                    found_better = true;
+                }
+            }
+        }
+    }
+    best_entry_point
 }
 
 /// FFI call to initialize a new FieldHnswIndex.
