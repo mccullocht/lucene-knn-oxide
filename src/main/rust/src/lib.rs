@@ -3,6 +3,8 @@
 //! With this implementation it is necessary to parse the field metadata once on each side of the
 //! FFI boundary since this implementation does not interact with IndexInput.
 
+#![feature(core_intrinsics)]
+
 pub mod direct_monotonic_reader;
 pub mod vint;
 
@@ -379,6 +381,11 @@ impl VectorSimilarity {
 
     pub fn score(&self, q: &[f32], d: &[f32]) -> f32 {
         assert_eq!(q.len(), d.len());
+        // Prefetch everything
+        for c in d.chunks(32) {
+            // 128 bytes, ~cacheline size, 3 is the "closest" locality for prefetching.
+            unsafe { core::intrinsics::prefetch_read_data(c.as_ptr(), 3) };
+        }
         match self {
             Self::Euclidean => 1.0f32 / (1.0f32 + SpatialSimilarity::l2sq(q, d).unwrap() as f32),
             Self::DotProduct => {
