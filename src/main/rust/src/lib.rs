@@ -336,7 +336,7 @@ impl FieldVectorData {
     }
 
     #[inline(always)]
-    pub fn score_many(&self, query: &[f32], ords: &[u32], scores: &mut [f32]) {
+    pub fn score_many_ords(&self, query: &[f32], mut ords: &[u32], mut scores: &mut [f32]) {
         let mut ord_chunks = ords.chunks_exact(8);
         let mut score_chunks = scores.chunks_exact_mut(8);
         for (ord_chunk, score_chunk) in ord_chunks.by_ref().zip(score_chunks.by_ref()) {
@@ -352,12 +352,28 @@ impl FieldVectorData {
             ];
             score_chunk.copy_from_slice(&self.similarity.score_many::<8, 128>(query, docs));
         }
-        for (ord, score) in ord_chunks
-            .remainder()
-            .iter()
-            .zip(score_chunks.into_remainder().iter_mut())
-        {
-            *score = self.similarity.score(query, self.get(*ord as usize))
+        ords = ord_chunks.remainder();
+        scores = score_chunks.into_remainder();
+        if ords.len() >= 4 {
+            let docs = [
+                self.get(ords[0] as usize),
+                self.get(ords[1] as usize),
+                self.get(ords[2] as usize),
+                self.get(ords[3] as usize),
+            ];
+            scores[..4].copy_from_slice(&self.similarity.score_many::<4, 128>(query, docs));
+            ords = &ords[4..];
+            scores = &mut scores[4..];
+            if ords.len() >= 2 {
+                let docs = [self.get(ords[0] as usize), self.get(ords[1] as usize)];
+                scores[..2].copy_from_slice(&self.similarity.score_many::<2, 128>(query, docs));
+                ords = &ords[2..];
+                scores = &mut scores[2..];
+
+                if ords.len() == 1 {
+                    scores[0] = self.similarity.score(query, self.get(ords[0] as usize));
+                }
+            }
         }
     }
 }
@@ -441,15 +457,14 @@ impl VectorSimilarity {
     fn dot(q: &[f32], d: &[f32]) -> f32 {
         unsafe {
             let mut dot = vdupq_n_f32(0.0);
-            let mut pp = d.as_ptr().add(128);
-            let pp_end = d.as_ptr().add(d.len());
-            for (qc, dc) in q.chunks(4).zip(d.chunks(4)) {
-                if pp < pp_end {
-                    core::arch::aarch64::_prefetch::<0, 3>(pp as *const i8);
-                    pp = pp.add(16);
+            for offset in (0..q.len()).step_by(4) {
+                if offset % 16 == 0 && offset + 128 < q.len() {
+                    core::arch::aarch64::_prefetch::<0, 3>(
+                        q.as_ptr().add(offset + 128) as *const i8
+                    );
                 }
-                let qc = vld1q_f32(qc.as_ptr());
-                let dc = vld1q_f32(dc.as_ptr());
+                let qc = vld1q_f32(q.as_ptr().add(offset));
+                let dc = vld1q_f32(d.as_ptr().add(offset));
                 dot = vfmaq_f32(dot, qc, dc);
             }
             vaddvq_f32(dot)
@@ -734,7 +749,7 @@ fn search_index(
         }
 
         scores.resize(ords.len(), 0.0);
-        vector_data.score_many(query, &ords, &mut scores);
+        vector_data.score_many_ords(query, &ords, &mut scores);
         for (vertex, score) in ords.drain(..).zip(scores.drain(..)) {
             let n = Neighbor { vertex, score };
             // This differs from lucene in that we limit the length of the queue.
