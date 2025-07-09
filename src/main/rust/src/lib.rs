@@ -337,16 +337,20 @@ impl FieldVectorData {
 
     #[inline(always)]
     pub fn score_many(&self, query: &[f32], ords: &[u32], scores: &mut [f32]) {
-        let mut ord_chunks = ords.chunks_exact(4);
-        let mut score_chunks = scores.chunks_exact_mut(4);
+        let mut ord_chunks = ords.chunks_exact(8);
+        let mut score_chunks = scores.chunks_exact_mut(8);
         for (ord_chunk, score_chunk) in ord_chunks.by_ref().zip(score_chunks.by_ref()) {
             let docs = [
                 self.get(ord_chunk[0] as usize),
                 self.get(ord_chunk[1] as usize),
                 self.get(ord_chunk[2] as usize),
                 self.get(ord_chunk[3] as usize),
+                self.get(ord_chunk[4] as usize),
+                self.get(ord_chunk[5] as usize),
+                self.get(ord_chunk[6] as usize),
+                self.get(ord_chunk[7] as usize),
             ];
-            score_chunk.copy_from_slice(&self.similarity.score_many(query, docs));
+            score_chunk.copy_from_slice(&self.similarity.score_many::<8, 128>(query, docs));
         }
         for (ord, score) in ord_chunks
             .remainder()
@@ -417,10 +421,14 @@ impl VectorSimilarity {
         }
     }
 
-    pub fn score_many<const N: usize>(&self, q: &[f32], docs: [&[f32]; N]) -> [f32; N] {
+    pub fn score_many<const N: usize, const P: usize>(
+        &self,
+        q: &[f32],
+        docs: [&[f32]; N],
+    ) -> [f32; N] {
         match self {
             Self::DotProduct => {
-                let mut scores = Self::dot_many::<N>(q, docs);
+                let mut scores = Self::dot_many::<N, P>(q, docs);
                 for n in 0..N {
                     scores[n] = 0.0f32.max(1.0f32 + scores[n]) / 2.0f32;
                 }
@@ -448,12 +456,19 @@ impl VectorSimilarity {
         }
     }
 
-    fn dot_many<const N: usize>(q: &[f32], docs: [&[f32]; N]) -> [f32; N] {
+    fn dot_many<const N: usize, const P: usize>(q: &[f32], docs: [&[f32]; N]) -> [f32; N] {
         unsafe {
+            for offset in (0..P).step_by(16) {
+                for n in 0..N {
+                    core::arch::aarch64::_prefetch::<0, 3>(
+                        docs[n].as_ptr().add(offset) as *const i8
+                    );
+                }
+            }
             let mut dot = [vdupq_n_f32(0.0); N];
             for offset in (0..q.len()).step_by(4) {
-                let prefetch_offset = 128 + offset;
-                if prefetch_offset < q.len() {
+                let prefetch_offset = P + offset;
+                if prefetch_offset % 16 == 0 && prefetch_offset < q.len() {
                     for n in 0..N {
                         core::arch::aarch64::_prefetch::<0, 3>(
                             docs[n].as_ptr().add(prefetch_offset) as *const i8,
