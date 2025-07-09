@@ -3,9 +3,12 @@
 //! With this implementation it is necessary to parse the field metadata once on each side of the
 //! FFI boundary since this implementation does not interact with IndexInput.
 
+#![feature(stdarch_aarch64_prefetch)]
+
 pub mod direct_monotonic_reader;
 pub mod vint;
 
+use std::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
 use std::collections::BinaryHeap;
 use std::iter::FusedIterator;
 
@@ -331,6 +334,28 @@ impl FieldVectorData {
             score: self.similarity.score(query, self.get(ord as usize)),
         }
     }
+
+    #[inline(always)]
+    pub fn score_many(&self, query: &[f32], ords: &[u32], scores: &mut [f32]) {
+        let mut ord_chunks = ords.chunks_exact(4);
+        let mut score_chunks = scores.chunks_exact_mut(4);
+        for (ord_chunk, score_chunk) in ord_chunks.by_ref().zip(score_chunks.by_ref()) {
+            let docs = [
+                self.get(ord_chunk[0] as usize),
+                self.get(ord_chunk[1] as usize),
+                self.get(ord_chunk[2] as usize),
+                self.get(ord_chunk[3] as usize),
+            ];
+            score_chunk.copy_from_slice(&self.similarity.score_many(query, docs));
+        }
+        for (ord, score) in ord_chunks
+            .remainder()
+            .iter()
+            .zip(score_chunks.into_remainder().iter_mut())
+        {
+            *score = self.similarity.score(query, self.get(*ord as usize))
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -384,10 +409,69 @@ impl VectorSimilarity {
             Self::DotProduct => {
                 // I tried a manual aarch64 SIMD implementation where I unrolled the loop (16d)
                 // and it was not any faster, maybe actually slower.
-                0.0f32.max((1.0f32 + SpatialSimilarity::dot(q, d).unwrap() as f32) / 2.0f32)
+                // XXX 0.0f32.max((1.0f32 + SpatialSimilarity::dot(q, d).unwrap() as f32) / 2.0f32)
+                0.0f32.max((1.0f32 + Self::dot(q, d)) / 2.0f32)
             }
             Self::Cosine => unimplemented!(),
             Self::MaximumInnerProduct => unimplemented!(),
+        }
+    }
+
+    pub fn score_many<const N: usize>(&self, q: &[f32], docs: [&[f32]; N]) -> [f32; N] {
+        match self {
+            Self::DotProduct => {
+                let mut scores = Self::dot_many::<N>(q, docs);
+                for n in 0..N {
+                    scores[n] = 0.0f32.max(1.0f32 + scores[n]) / 2.0f32;
+                }
+                scores
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    fn dot(q: &[f32], d: &[f32]) -> f32 {
+        unsafe {
+            let mut dot = vdupq_n_f32(0.0);
+            let mut pp = d.as_ptr().add(128);
+            let pp_end = d.as_ptr().add(d.len());
+            for (qc, dc) in q.chunks(4).zip(d.chunks(4)) {
+                if pp < pp_end {
+                    core::arch::aarch64::_prefetch::<0, 3>(pp as *const i8);
+                    pp = pp.add(16);
+                }
+                let qc = vld1q_f32(qc.as_ptr());
+                let dc = vld1q_f32(dc.as_ptr());
+                dot = vfmaq_f32(dot, qc, dc);
+            }
+            vaddvq_f32(dot)
+        }
+    }
+
+    fn dot_many<const N: usize>(q: &[f32], docs: [&[f32]; N]) -> [f32; N] {
+        unsafe {
+            let mut dot = [vdupq_n_f32(0.0); N];
+            for offset in (0..q.len()).step_by(4) {
+                let prefetch_offset = 128 + offset;
+                if prefetch_offset < q.len() {
+                    for n in 0..N {
+                        core::arch::aarch64::_prefetch::<0, 3>(
+                            docs[n].as_ptr().add(prefetch_offset) as *const i8,
+                        );
+                    }
+                }
+
+                let qv = vld1q_f32(q.as_ptr().add(offset));
+                for n in 0..N {
+                    dot[n] = vfmaq_f32(dot[n], qv, vld1q_f32(docs[n].as_ptr().add(offset)));
+                }
+            }
+
+            let mut scores = [0.0f32; N];
+            for n in 0..N {
+                scores[n] = vaddvq_f32(dot[n]);
+            }
+            scores
         }
     }
 }
@@ -618,6 +702,8 @@ fn search_index(
     {
         queue.push(best_entry_point);
     }
+    let mut ords = Vec::with_capacity(index.max_edges * 2);
+    let mut scores = Vec::with_capacity(index.max_edges * 2);
     while let Some(candidate) = candidates.pop_min() {
         // If the best candidate is worse than the worst result, break.
         if candidate.score < queue.min_similarity() {
@@ -629,7 +715,13 @@ fn search_index(
                 continue;
             }
 
-            let n = vector_data.score_ord(query, vertex);
+            ords.push(vertex);
+        }
+
+        scores.resize(ords.len(), 0.0);
+        vector_data.score_many(query, &ords, &mut scores);
+        for (vertex, score) in ords.drain(..).zip(scores.drain(..)) {
+            let n = Neighbor { vertex, score };
             // This differs from lucene in that we limit the length of the queue.
             if candidates.len() < queue.len() {
                 candidates.push(n);
