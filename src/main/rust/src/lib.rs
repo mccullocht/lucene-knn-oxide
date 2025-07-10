@@ -346,6 +346,17 @@ impl FieldVectorData {
             ),
         }
     }
+
+    #[inline(always)]
+    pub fn prefetch(&self, ord: u32) {
+        let p = self.get(ord as usize);
+        unsafe {
+            for i in (0..p.len()).step_by(16) {
+                use core::arch::aarch64::{_PREFETCH_LOCALITY3, _PREFETCH_READ, _prefetch};
+                _prefetch::<_PREFETCH_READ, _PREFETCH_LOCALITY3>(p.as_ptr().add(i) as *const i8);
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -687,6 +698,8 @@ fn search_index(
                 if accept_ords.map(|s| s.get(last as usize)).unwrap_or(true) {
                     queue.push(n);
                 }
+            } else {
+                vector_data.prefetch(vertex);
             }
             last_vertex = Some(vertex);
         }
