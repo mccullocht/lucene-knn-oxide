@@ -129,8 +129,7 @@ class NativeVectorAccess {
     public static void search(IndexField index, VectorDataField vectors, float[] query, KnnCollector collector,
             Bits acceptDocs) {
         try (Arena searchArena = Arena.ofConfined()) {
-            var querySegment = searchArena.allocateArray(ValueLayout.JAVA_FLOAT, query.length);
-            querySegment.asByteBuffer().order(ByteOrder.nativeOrder()).asFloatBuffer().put(query);
+            var querySegment = searchArena.allocateFrom(ValueLayout.JAVA_FLOAT, query);
 
             // XXX we are assuming 1:1 doc:ord which is fine for now but wrong in the long
             // run. it's also offensive to have to re-serialize this.
@@ -142,15 +141,14 @@ class NativeVectorAccess {
             MemorySegment acceptOrdsSegment = null;
             long acceptOrdsLen = 0;
             if (acceptOrds != null) {
-                acceptOrdsSegment = searchArena.allocateArray(ValueLayout.JAVA_LONG, acceptOrds.getBits().length);
-                acceptOrdsSegment.asByteBuffer().order(ByteOrder.nativeOrder()).asLongBuffer()
-                        .put(acceptOrds.getBits());
+                acceptOrdsSegment = searchArena.allocateFrom(ValueLayout.JAVA_LONG, acceptOrds.getBits());
                 acceptOrdsLen = acceptOrds.getBits().length;
             } else {
                 acceptOrdsSegment = MemorySegment.ofAddress(0);
             }
 
-            var resultsSegment = searchArena.allocateArray(NEIGHBOR_LAYOUT, collector.k());
+            var resultsLayout = MemoryLayout.sequenceLayout(collector.k(), NEIGHBOR_LAYOUT);
+            var resultsSegment = searchArena.allocate(resultsLayout);
             try {
                 long numResults = (long) SEARCH_INDEX_METHOD.invokeExact(index.ptr, vectors.ptr, querySegment,
                         (long) query.length, acceptOrdsSegment, acceptOrdsLen, resultsSegment, (long) collector.k());
