@@ -29,6 +29,7 @@ class NativeVectorAccess {
     private static final MethodHandle CLOSE_INDEX_FIELD_METHOD;
 
     private static final MethodHandle SEARCH_INDEX_METHOD;
+    private static final MethodHandle BULK_SCORE_METHOD;
 
     static {
         try {
@@ -66,6 +67,16 @@ class NativeVectorAccess {
                     ValueLayout.JAVA_LONG // results len
             );
             SEARCH_INDEX_METHOD = linker.downcallHandle(searchIndexAddr, searchIndesDesc);
+
+            MemorySegment bulkScoreAddr = nativeLib.find("lucene_knn_oxide_bulk_score").orElseThrow();
+            FunctionDescriptor bulkScoreDesc = FunctionDescriptor.ofVoid(
+                    ValueLayout.ADDRESS, // vector data ptr
+                    ValueLayout.ADDRESS, // query ptr
+                    ValueLayout.JAVA_LONG, // query len
+                    ValueLayout.ADDRESS, // neighbors ptr
+                    ValueLayout.JAVA_LONG // neighbors len
+            );
+            BULK_SCORE_METHOD = linker.downcallHandle(bulkScoreAddr, bulkScoreDesc);
         } catch (IOException e) {
             throw new UnsatisfiedLinkError("Could not link native vector access lib.");
         }
@@ -129,7 +140,7 @@ class NativeVectorAccess {
     public static void search(IndexField index, VectorDataField vectors, float[] query, KnnCollector collector,
             Bits acceptDocs) {
         try (Arena searchArena = Arena.ofConfined()) {
-            var querySegment = searchArena.allocateFrom(ValueLayout.JAVA_FLOAT, query);
+            var querySegment = vectorAsMemorySegment(query, searchArena);
 
             // XXX we are assuming 1:1 doc:ord which is fine for now but wrong in the long
             // run. it's also offensive to have to re-serialize this.
@@ -159,6 +170,24 @@ class NativeVectorAccess {
             } catch (Throwable t) {
                 throw new RuntimeException("unreachable! (search)", t);
             }
+        }
+    }
+
+    public static MemorySegment vectorAsMemorySegment(float[] vector, Arena arena) {
+        return arena.allocateFrom(ValueLayout.JAVA_FLOAT, vector);
+    }
+
+    public static float scoreOrd(VectorDataField vectors, MemorySegment query, int ord) {
+        try (var arena = Arena.ofConfined()) {
+            var neighbor = arena.allocate(NEIGHBOR_LAYOUT);
+            neighbor.set(ORD_LAYOUT, 0, ord);
+            try {
+                BULK_SCORE_METHOD.invokeExact(vectors.ptr, query, query.byteSize() / ValueLayout.JAVA_FLOAT.byteSize(),
+                        neighbor, 1);
+            } catch (Throwable t) {
+                throw new RuntimeException("unreachable! (scoreOrd)", t);
+            }
+            return neighbor.get(SCORE_LAYOUT, 4);
         }
     }
 

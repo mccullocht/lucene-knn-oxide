@@ -23,6 +23,7 @@ import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader.readVe
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.util.Optional;
 
 import org.apache.lucene.codecs.CodecUtil;
@@ -47,6 +48,8 @@ import org.apache.lucene.store.ReadAdvice;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.RamUsageEstimator;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
+
+import com.github.mccullocht.nvector.NativeVectorAccess.VectorDataField;
 
 /**
  * Reads vectors from the index segments.
@@ -219,18 +222,38 @@ public final class NativeFlatVectorsReader extends FlatVectorsReader {
   @Override
   public RandomVectorScorer getRandomVectorScorer(String field, float[] target) throws IOException {
     final FieldEntry fieldEntry = getFieldEntry(field, VectorEncoding.FLOAT32);
-    return vectorScorer.getRandomVectorScorer(
-        fieldEntry.similarityFunction,
-        OffHeapFloatVectorValues.load(
-            fieldEntry.similarityFunction,
-            vectorScorer,
-            fieldEntry.ordToDoc,
-            fieldEntry.vectorEncoding,
-            fieldEntry.dimension,
-            fieldEntry.vectorDataOffset,
-            fieldEntry.vectorDataLength,
-            vectorData),
-        target);
+    if (fieldEntry.nativeField.isPresent()) {
+      return new RandomVectorScorer() {
+        // Use an auto arena; RandomVectorScorer is not closeable so we can't be sure
+        // that native segments will be freed.
+        private Arena arena = Arena.ofAuto();
+        private MemorySegment query = NativeVectorAccess.vectorAsMemorySegment(target, arena);
+        private VectorDataField field = fieldEntry.nativeField.get();
+
+        @Override
+        public int maxOrd() {
+          return fieldEntry.size;
+        }
+
+        @Override
+        public float score(int node) throws IOException {
+          return NativeVectorAccess.scoreOrd(this.field, this.query, node);
+        }
+      };
+    } else {
+      return vectorScorer.getRandomVectorScorer(
+          fieldEntry.similarityFunction,
+          OffHeapFloatVectorValues.load(
+              fieldEntry.similarityFunction,
+              vectorScorer,
+              fieldEntry.ordToDoc,
+              fieldEntry.vectorEncoding,
+              fieldEntry.dimension,
+              fieldEntry.vectorDataOffset,
+              fieldEntry.vectorDataLength,
+              vectorData),
+          target);
+    }
   }
 
   @Override
