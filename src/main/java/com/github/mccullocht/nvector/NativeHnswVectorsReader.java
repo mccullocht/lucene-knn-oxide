@@ -68,6 +68,7 @@ public final class NativeHnswVectorsReader extends KnnVectorsReader
         implements QuantizedVectorsReader, HnswGraphProvider {
 
     private static final long SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(NativeHnswVectorsFormat.class);
+    private static final boolean USE_VECTOR_INDEX = System.getenv("DISABLE_NATIVE_HNSW_INDEX") == null;
 
     private final NativeFlatVectorsReader flatVectorsReader;
     private final FieldInfos fieldInfos;
@@ -271,7 +272,7 @@ public final class NativeHnswVectorsReader extends KnnVectorsReader
         final Optional<NativeVectorAccess.IndexField> indexEntry = fieldEntry.nativeField;
         final Optional<NativeVectorAccess.VectorDataField> flatEntry = flatVectorsReader.getFieldEntry(field,
                 VectorEncoding.FLOAT32).nativeField();
-        if (indexEntry.isPresent() && flatEntry.isPresent()) {
+        if (indexEntry.isPresent() && flatEntry.isPresent() && USE_VECTOR_INDEX) {
             NativeVectorAccess.search(indexEntry.get(), flatEntry.get(), target, knnCollector, acceptDocs);
         } else {
             search(
