@@ -17,8 +17,7 @@ repositories {
 }
 
 dependencies {
-    implementation("org.apache.lucene:lucene-core:10.2.1")
-    testImplementation("org.apache.lucene:lucene-test-framework:10.2.1")
+    implementation files("../lucene/lucene/distribution/build/packages/lucene-11.0.0-SNAPSHOT-itests/modules/lucene-core-11.0.0-SNAPSHOT.jar")
     rust(project(":src:main:rust"))
 }
 
@@ -28,4 +27,5 @@ tasks.withType(JavaCompile) {
 
 tasks.withType(Test) {
     jvmArgs += '--enable-preview'
+    jvmArgs += '--enable-native-access=ALL-UNNAMED'
 }

@@ -332,9 +332,9 @@ impl FieldVectorData {
         }
     }
 
-    pub fn score_ords(&self, query: &[f32], neighbors: &mut [Neighbor]) {
-        for n in neighbors {
-            n.score = self.similarity.score(query, self.get(n.vertex as usize));
+    pub fn score_ords(&self, query: &[f32], ords: &[u32], scores: &mut [f32]) {
+        for (ord, score) in ords.iter().zip(scores.iter_mut()) {
+            *score = self.similarity.score(query, self.get(*ord as usize));
         }
     }
 }
@@ -793,18 +793,21 @@ pub unsafe extern "C" fn lucene_knn_oxide_search_hnsw_field(
 /// # Safety
 /// * `vector_data` may not be null.
 /// * `query_ptr` may not be null and must be appropriately aligned.
-/// * `neighbor_ptr` may not be null and must be appropriately aligned.
+/// * `ords_ptr` may not be null and must be appropriately aligned.
+/// * `scores_ptr` may not be null, must be appropriately aligned, and must be at least ords_len long.
 /// * All lengths must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lucene_knn_oxide_bulk_score(
     vector_data: *mut FieldVectorData,
     query_ptr: *const f32,
     query_len: usize,
-    neighbor_ptr: *mut Neighbor,
-    neighbor_len: usize,
+    ords_ptr: *const u32,
+    scores_ptr: *mut f32,
+    ords_len: usize,
 ) {
     let vector_data = unsafe { vector_data.as_ref().expect("vector_data is not null") };
     let query = unsafe { std::slice::from_raw_parts(query_ptr, query_len) };
-    let neighbors = unsafe { std::slice::from_raw_parts_mut(neighbor_ptr, neighbor_len) };
-    vector_data.score_ords(query, neighbors);
+    let ords = unsafe { std::slice::from_raw_parts(ords_ptr, ords_len) };
+    let scores = unsafe { std::slice::from_raw_parts_mut(scores_ptr, ords_len) };
+    vector_data.score_ords(query, ords, scores);
 }

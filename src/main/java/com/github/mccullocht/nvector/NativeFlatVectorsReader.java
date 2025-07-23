@@ -42,6 +42,9 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
+import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.FileDataHint;
+import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.ReadAdvice;
@@ -78,7 +81,7 @@ public final class NativeFlatVectorsReader extends FlatVectorsReader {
           // Flat formats are used to randomly access vectors from their node ID that is
           // stored
           // in the HNSW graph.
-          state.context.withReadAdvice(ReadAdvice.RANDOM));
+          state.context.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM));
       readMetadata(state);
       success = true;
     } finally {
@@ -237,7 +240,14 @@ public final class NativeFlatVectorsReader extends FlatVectorsReader {
 
         @Override
         public float score(int node) throws IOException {
-          return NativeVectorAccess.scoreOrd(this.field, this.query, node);
+          float[] scores = { 0.0f };
+          bulkScore(new int[] { node }, scores, 1);
+          return scores[0];
+        }
+
+        @Override
+        public void bulkScore(int[] nodes, float[] scores, int numNodes) throws IOException {
+          NativeVectorAccess.scoreOrds(this.field, query, nodes, scores, numNodes);
         }
       };
     } else {

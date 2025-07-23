@@ -177,17 +177,20 @@ class NativeVectorAccess {
         return arena.allocateFrom(ValueLayout.JAVA_FLOAT, vector);
     }
 
-    public static float scoreOrd(VectorDataField vectors, MemorySegment query, int ord) {
+    public static void scoreOrds(VectorDataField vectors, MemorySegment query, int[] ords, float[] scores,
+            int numOrds) {
         try (var arena = Arena.ofConfined()) {
-            var neighbor = arena.allocate(NEIGHBOR_LAYOUT);
-            neighbor.set(ORD_LAYOUT, 0, ord);
+            var ordsSegment = arena.allocateFrom(ValueLayout.JAVA_INT, ords);
+            var scoresSegment = arena.allocate(ValueLayout.JAVA_FLOAT, numOrds);
             try {
                 BULK_SCORE_METHOD.invokeExact(vectors.ptr, query, query.byteSize() / ValueLayout.JAVA_FLOAT.byteSize(),
-                        neighbor, 1);
+                        ordsSegment, scoresSegment, (long) numOrds);
             } catch (Throwable t) {
-                throw new RuntimeException("unreachable! (scoreOrd)", t);
+                throw new RuntimeException("unreachable! (scoreOrds)", t);
             }
-            return neighbor.get(SCORE_LAYOUT, 4);
+            for (int i = 0; i < numOrds; i++) {
+                scores[i] = scoresSegment.getAtIndex(ValueLayout.JAVA_FLOAT, i);
+            }
         }
     }
 
