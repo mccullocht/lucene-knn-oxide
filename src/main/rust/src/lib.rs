@@ -3,9 +3,14 @@
 //! With this implementation it is necessary to parse the field metadata once on each side of the
 //! FFI boundary since this implementation does not interact with IndexInput.
 
+#![feature(stdarch_aarch64_prefetch)]
+
 pub mod direct_monotonic_reader;
 pub mod vint;
 
+use std::arch::aarch64::{
+    _PREFETCH_LOCALITY3, _PREFETCH_READ, _prefetch, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32,
+};
 use std::collections::BinaryHeap;
 use std::iter::FusedIterator;
 
@@ -333,8 +338,32 @@ impl FieldVectorData {
     }
 
     pub fn score_ords(&self, query: &[f32], ords: &[u32], scores: &mut [f32]) {
-        for (ord, score) in ords.iter().zip(scores.iter_mut()) {
-            *score = self.similarity.score(query, self.get(*ord as usize));
+        if ords.is_empty() {
+            return;
+        }
+
+        self.prefetch_ord(ords[0]);
+        for i in 0..(ords.len() - 1) {
+            scores[i] = self.similarity.score_and_prefetch(
+                query,
+                self.get(ords[i] as usize),
+                self.get(ords[i + 1] as usize),
+            );
+        }
+        scores[ords.len() - 1] = self
+            .similarity
+            .score(query, self.get(ords.len() as usize - 1));
+    }
+
+    fn prefetch_ord(&self, ord: u32) {
+        // NB: this doesn't consider whether the start address is cacheline aligned
+        // so YMMV. if it is unaligned it might miss one load at the end of the
+        // vector which hopefully the processor would be smart enough to pick up on.
+        let p = self.get(ord as usize);
+        unsafe {
+            for i in (0..p.len()).step_by(16 /* 64 bytes */) {
+                _prefetch::<_PREFETCH_READ, _PREFETCH_LOCALITY3>(p.as_ptr().add(i) as *const i8);
+            }
         }
     }
 }
@@ -394,6 +423,31 @@ impl VectorSimilarity {
             }
             Self::Cosine => unimplemented!(),
             Self::MaximumInnerProduct => unimplemented!(),
+        }
+    }
+
+    /// Score `q` against `d`; prefetch the vector for `p` (next to score).
+    pub fn score_and_prefetch(&self, q: &[f32], d: &[f32], p: &[f32]) -> f32 {
+        match self {
+            Self::DotProduct => {
+                let dot = unsafe {
+                    let mut dot = vdupq_n_f32(0.0);
+                    for i in (0..q.len()).step_by(4) {
+                        if i % 16 == 0 {
+                            _prefetch::<_PREFETCH_READ, _PREFETCH_LOCALITY3>(
+                                p.as_ptr().add(i) as *const i8
+                            );
+                        }
+                        let qv = vld1q_f32(q.as_ptr().add(i));
+                        let dv = vld1q_f32(d.as_ptr().add(i));
+                        dot = vfmaq_f32(dot, qv, dv);
+                    }
+
+                    vaddvq_f32(dot)
+                };
+                0.0f32.max((1.0f32 + dot) / 2.0f32)
+            }
+            _ => self.score(q, d),
         }
     }
 }
