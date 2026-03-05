@@ -3,9 +3,12 @@
 //! With this implementation it is necessary to parse the field metadata once on each side of the
 //! FFI boundary since this implementation does not interact with IndexInput.
 
+#![feature(stdarch_aarch64_prefetch)]
+
 pub mod direct_monotonic_reader;
 pub mod vint;
 
+use std::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
 use std::collections::BinaryHeap;
 use std::iter::FusedIterator;
 
@@ -331,6 +334,29 @@ impl FieldVectorData {
             score: self.similarity.score(query, self.get(ord as usize)),
         }
     }
+
+    #[inline(always)]
+    pub fn score_ord_and_prefetch(&self, query: &[f32], ord: u32, prefetch_ord: u32) -> Neighbor {
+        Neighbor {
+            vertex: ord,
+            score: self.similarity.score_and_prefetch(
+                query,
+                self.get(ord as usize),
+                self.get(prefetch_ord as usize),
+            ),
+        }
+    }
+
+    #[inline(always)]
+    pub fn prefetch(&self, ord: u32) {
+        let p = self.get(ord as usize);
+        unsafe {
+            for i in (0..p.len()).step_by(16) {
+                use core::arch::aarch64::{_PREFETCH_LOCALITY3, _PREFETCH_READ, _prefetch};
+                _prefetch::<_PREFETCH_READ, _PREFETCH_LOCALITY3>(p.as_ptr().add(i) as *const i8);
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -388,6 +414,37 @@ impl VectorSimilarity {
             }
             Self::Cosine => unimplemented!(),
             Self::MaximumInnerProduct => unimplemented!(),
+        }
+    }
+
+    pub fn score_and_prefetch(&self, q: &[f32], d: &[f32], p: &[f32]) -> f32 {
+        assert_eq!(q.len(), d.len());
+        match self {
+            Self::Euclidean => 1.0f32 / (1.0f32 + SpatialSimilarity::l2sq(q, d).unwrap() as f32),
+            Self::DotProduct => {
+                // I tried a manual aarch64 SIMD implementation where I unrolled the loop (16d)
+                // and it was not any faster, maybe actually slower.
+                0.0f32.max((1.0f32 + Self::dot(q, d, p) as f32) / 2.0f32)
+            }
+            Self::Cosine => unimplemented!(),
+            Self::MaximumInnerProduct => unimplemented!(),
+        }
+    }
+
+    fn dot(q: &[f32], d: &[f32], p: &[f32]) -> f32 {
+        unsafe {
+            let mut dot = vdupq_n_f32(0.0);
+            for i in (0..q.len()).step_by(4) {
+                if i % 16 == 0 {
+                    use core::arch::aarch64::{_PREFETCH_LOCALITY3, _PREFETCH_READ, _prefetch};
+                    _prefetch::<_PREFETCH_READ, _PREFETCH_LOCALITY3>(p.as_ptr().add(i) as *const i8);
+                }
+
+                let qv = vld1q_f32(q.as_ptr().add(i));
+                let dv = vld1q_f32(d.as_ptr().add(i));
+                dot = vfmaq_f32(dot, qv, dv);
+            }
+            vaddvq_f32(dot)
         }
     }
 }
@@ -624,11 +681,30 @@ fn search_index(
             break;
         }
 
+        let mut last_vertex = None;
         for vertex in index.edge_iter(0, candidate.vertex) {
             if !visited.insert(vertex) {
                 continue;
             }
 
+            if let Some(last) = last_vertex {
+                let n = vector_data.score_ord_and_prefetch(query, last, vertex);
+                // This differs from lucene in that we limit the length of the queue.
+                if candidates.len() < queue.len() {
+                    candidates.push(n);
+                } else {
+                    candidates.push_pop_max(n);
+                }
+                if accept_ords.map(|s| s.get(last as usize)).unwrap_or(true) {
+                    queue.push(n);
+                }
+            } else {
+                vector_data.prefetch(vertex);
+            }
+            last_vertex = Some(vertex);
+        }
+
+        if let Some(vertex) = last_vertex {
             let n = vector_data.score_ord(query, vertex);
             // This differs from lucene in that we limit the length of the queue.
             if candidates.len() < queue.len() {
